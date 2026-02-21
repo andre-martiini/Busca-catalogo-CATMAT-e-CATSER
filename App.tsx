@@ -4,10 +4,19 @@ import { ServiceItem, MaterialItem, AppView } from './types';
 import { parseFile } from './parser';
 import { db } from './db';
 import { getSmartExpansion, SearchExpansion } from './geminiService';
+import MiniSearch from 'minisearch';
 
-const REMOTE_URLS = {
-  catser: 'https://raw.githubusercontent.com/andre-martiini/meus-catalogos/main/Lista_CATSER_CORRIGIDA.xlsx',
-  catmat: 'https://raw.githubusercontent.com/andre-martiini/meus-catalogos/main/Lista_CATMAT.xlsx'
+const STOP_WORDS = new Set(['de', 'da', 'do', 'das', 'dos', 'para', 'com', 'em', 'na', 'no', 'ou', 'e', 'a', 'o', 'as', 'os', 'um', 'uma', 'uns', 'umas', 'por']);
+
+const LOCAL_URLS = {
+  catser: '/data/Lista_CATSER_CORRIGIDA.xlsx',
+  catmat: '/data/Lista_CATMAT.xlsx'
+};
+
+const toSentenceCase = (str: string) => {
+  if (!str) return '';
+  const lower = str.toLowerCase();
+  return lower.charAt(0).toUpperCase() + lower.slice(1);
 };
 
 export default function App() {
@@ -44,14 +53,14 @@ export default function App() {
   };
 
   const downloadAndProcess = useCallback(async (type: 'catser' | 'catmat') => {
-    const url = REMOTE_URLS[type];
+    const url = LOCAL_URLS[type];
     setSyncTarget(type.toUpperCase() as any);
     setSyncPhase('downloading');
     setProgress(0);
 
     try {
       const response = await fetch(url);
-      if (!response.ok) throw new Error(`Falha na conexão (${response.status})`);
+      if (!response.ok) throw new Error(`Falha ao ler arquivo local (${response.status})`);
 
       const contentLength = +(response.headers.get('Content-Length') || 0);
       const reader = response.body?.getReader();
@@ -201,42 +210,102 @@ export default function App() {
       .sort((a, b) => b.count - a.count);
   }, [expansion, currentCatalog, filterGroup, deferredSearchTerm]);
 
-  // Filtragem e RANKING por relevância
+  // Criação dos Índices Invertidos (MiniSearch) imediatamente após carga em memória
+  const catserIndex = useMemo(() => {
+    const miniSearch = new MiniSearch({
+      idField: 'codigoServico',
+      fields: ['descricaoServico', 'classeDescricao', 'grupoDescricao'],
+      storeFields: ['codigoServico', 'grupoDescricao'],
+      searchOptions: {
+        boost: { descricaoServico: 3, classeDescricao: 1, grupoDescricao: 1 },
+        fuzzy: 0.2,
+        prefix: true,
+        combineWith: 'OR'
+      },
+      tokenize: (string) => string.toLowerCase().split(/[\s\-]+/).filter(token => token.length > 2 && !STOP_WORDS.has(token)),
+      processTerm: (term) => term.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    });
+    if (catserCatalog.length > 0) miniSearch.addAll(catserCatalog);
+    return miniSearch;
+  }, [catserCatalog]);
+
+  const catmatIndex = useMemo(() => {
+    const miniSearch = new MiniSearch({
+      idField: 'codigoMaterial',
+      fields: ['descricaoMaterial', 'classeDescricao', 'grupoDescricao'],
+      storeFields: ['codigoMaterial', 'grupoDescricao'],
+      searchOptions: {
+        boost: { descricaoMaterial: 3, classeDescricao: 1, grupoDescricao: 1 },
+        fuzzy: 0.2,
+        prefix: true,
+        combineWith: 'OR'
+      },
+      tokenize: (string) => string.toLowerCase().split(/[\s\-]+/).filter(token => token.length > 2 && !STOP_WORDS.has(token)),
+      processTerm: (term) => term.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+    });
+    if (catmatCatalog.length > 0) miniSearch.addAll(catmatCatalog);
+    return miniSearch;
+  }, [catmatCatalog]);
+
+  const currentCatalogMap = useMemo(() => {
+    const map = new Map<string, any>();
+    const isMat = view === 'catmat';
+    const idField = isMat ? 'codigoMaterial' : 'codigoServico';
+    for (const item of currentCatalog) {
+      map.set(String(item[idField]), item);
+    }
+    return map;
+  }, [currentCatalog, view]);
+
+  // Filtragem e RANKING por relevância com MiniSearch (BM25)
   const filteredData = useMemo(() => {
     if (view === 'syncing') return [];
-    
-    const activeTermsNormalized = activeExpansionTerms.map(normalize).filter(t => t.length > 0);
 
-    if (activeTermsNormalized.length === 0) {
+    if (activeExpansionTerms.length === 0) {
       if (filterGroup === 'Todos') return currentCatalog;
       return currentCatalog.filter(item => item.grupoDescricao === filterGroup);
     }
 
-    // Calculamos o score de cada item com base no número de matches de tags
-    const scoredResults = [];
-    for (const item of currentCatalog) {
-      const matchGroup = filterGroup === 'Todos' || item.grupoDescricao === filterGroup;
-      if (!matchGroup) continue;
+    const currentSearchIndex = view === 'catser' ? catserIndex : catmatIndex;
 
-      const itemText = normalize(Object.values(item).join(' '));
-      let score = 0;
-      
-      for (const term of activeTermsNormalized) {
-        if (itemText.includes(term)) {
-          score++;
-        }
-      }
+    const queries = activeExpansionTerms.map(term => {
+      const isOriginal = normalize(term) === normalize(deferredSearchTerm);
+      return {
+        queries: [term],
+        boost: isOriginal ? 5 : 1
+      };
+    });
 
-      if (score > 0) {
-        scoredResults.push({ item, score });
-      }
+    const searchResults = currentSearchIndex.search({
+      combineWith: 'OR',
+      queries
+    }, {
+      filter: (result) => filterGroup === 'Todos' || result.grupoDescricao === filterGroup
+    });
+
+    const mapped = [];
+    for (const res of searchResults) {
+      const item = currentCatalogMap.get(String(res.id));
+      if (item) mapped.push(item);
     }
 
-    // Ordenação: 1. Score Decrescente (Relevância) / 2. Ordem original (Tie-breaker)
-    return scoredResults
-      .sort((a, b) => b.score - a.score)
-      .map(r => r.item);
-  }, [currentCatalog, filterGroup, view, activeExpansionTerms]);
+    return mapped;
+  }, [currentCatalog, currentCatalogMap, view, catserIndex, catmatIndex, activeExpansionTerms, deferredSearchTerm, filterGroup]);
+
+  // Checagem se existem resultados na OUTRA aba para o aviso de erro
+  const existsInOtherCatalog = useMemo(() => {
+    if (filteredData.length > 0 || deferredSearchTerm.trim().length < 3) return false;
+    
+    const otherIndex = view === 'catser' ? catmatIndex : catserIndex;
+    const queries = activeExpansionTerms.length > 0 ? activeExpansionTerms : [deferredSearchTerm];
+    
+    const results = otherIndex.search({
+      combineWith: 'OR',
+      queries: queries.map(q => ({ queries: [q] }))
+    });
+    
+    return results.length > 0;
+  }, [filteredData, view, catserIndex, catmatIndex, activeExpansionTerms, deferredSearchTerm]);
 
   const groups = useMemo(() => {
     const set = new Set(currentCatalog.map(i => i.grupoDescricao));
@@ -275,8 +344,12 @@ export default function App() {
     );
   };
 
+  const isService = view === 'catser';
+  const themeColor = isService ? 'blue' : 'emerald';
+  const themeClass = isService ? 'bg-blue-600 shadow-blue-100' : 'bg-emerald-600 shadow-emerald-100';
+
   const handleRefresh = async () => {
-    if (confirm('Deseja atualizar os catálogos agora? Isso baixará as planilhas novamente do GitHub.')) {
+    if (confirm('Deseja recarregar os catálogos agora? Isso refará a importação das planilhas internas.')) {
         await db.clear();
         window.location.reload();
     }
@@ -316,14 +389,14 @@ export default function App() {
         <div className="flex items-center gap-8">
           <div className="flex flex-col">
             <h1 className="text-lg font-black text-slate-900 leading-none tracking-tight uppercase">Pesquisa Inteligente</h1>
-            <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest mt-1">CATMAT & CATSER</span>
+            <span className={`text-[9px] font-bold text-${themeColor}-500 uppercase tracking-widest mt-1`}>CATMAT & CATSER</span>
           </div>
           <div className="h-8 w-[1px] bg-slate-100"></div>
           <div className="flex gap-2">
-            <button onClick={() => {setView('catser'); setCurrentPage(1)}} className={`px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${view === 'catser' ? 'bg-blue-600 text-white shadow-lg shadow-blue-100' : 'bg-slate-50 text-slate-400 hover:bg-slate-100'}`}>
+            <button onClick={() => {setView('catser'); setCurrentPage(1)}} className={`px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${isService ? `bg-blue-600 text-white shadow-lg shadow-blue-100` : 'bg-slate-50 text-slate-400 hover:bg-slate-100'}`}>
               Serviços ({catserCatalog.length})
             </button>
-            <button onClick={() => {setView('catmat'); setCurrentPage(1)}} className={`px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${view === 'catmat' ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-100' : 'bg-slate-50 text-slate-400 hover:bg-slate-100'}`}>
+            <button onClick={() => {setView('catmat'); setCurrentPage(1)}} className={`px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${!isService ? `bg-emerald-600 text-white shadow-lg shadow-emerald-100` : 'bg-slate-50 text-slate-400 hover:bg-slate-100'}`}>
               Materiais ({catmatCatalog.length})
             </button>
           </div>
@@ -337,17 +410,17 @@ export default function App() {
         <div className="flex flex-col gap-4 mb-8">
           <div className="flex flex-col md:flex-row gap-4">
             <div className="flex-1 relative group">
-              <i className={`fas ${isExpanding ? 'fa-circle-notch animate-spin text-blue-500' : 'fa-search text-slate-300'} absolute left-6 top-1/2 -translate-y-1/2 group-focus-within:text-blue-500 transition-colors`}></i>
+              <i className={`fas ${isExpanding ? `fa-circle-notch animate-spin text-${themeColor}-500` : `fa-search text-slate-300`} absolute left-6 top-1/2 -translate-y-1/2 group-focus-within:text-${themeColor}-500 transition-colors`}></i>
               <input 
                 type="text" 
-                placeholder="Ex: 'conserto de ar-condicionado', 'reforma de escritório'..."
+                placeholder={`Pesquisar ${isService ? 'serviços' : 'materiais'}...`}
                 value={searchInput}
                 onChange={e => {setSearchInput(e.target.value); setCurrentPage(1)}}
-                className="w-full bg-white border-2 border-slate-100 rounded-2xl pl-16 pr-6 py-5 text-lg font-medium outline-none focus:border-blue-500 transition-all shadow-sm"
+                className={`w-full bg-white border-2 border-slate-100 rounded-2xl pl-16 pr-6 py-5 text-lg font-medium outline-none focus:border-${themeColor}-500 transition-all shadow-sm`}
               />
               {isExpanding && (
                 <div className="absolute right-6 top-1/2 -translate-y-1/2 flex items-center gap-2">
-                   <span className="px-3 py-1 bg-blue-50 text-blue-600 text-[10px] font-black uppercase rounded-lg border border-blue-100">
+                   <span className={`px-3 py-1 bg-${themeColor}-50 text-${themeColor}-600 text-[10px] font-black uppercase rounded-lg border border-${themeColor}-100`}>
                      Ranking Inteligente...
                    </span>
                 </div>
@@ -440,58 +513,77 @@ export default function App() {
 
         <div className="grid grid-cols-1 gap-4">
           {paginatedData.length === 0 ? (
-            <div className="py-32 flex flex-col items-center justify-center bg-white rounded-[2rem] border-2 border-dashed border-slate-200 text-slate-300">
-              <i className="fas fa-search-minus text-6xl mb-6"></i>
-              <h3 className="font-black text-sm uppercase tracking-[0.3em]">Nada foi encontrado</h3>
-              <p className="text-xs font-medium mt-2">Tente ativar outras tags de sugestão da IA.</p>
+            <div className={`py-32 flex flex-col items-center justify-center bg-white rounded-[2rem] border-2 border-dashed border-slate-200 text-slate-300`}>
+              {existsInOtherCatalog ? (
+                <div className="text-center animate-in fade-in slide-in-from-bottom-4 duration-500">
+                   <div className={`w-20 h-20 bg-${isService ? 'emerald' : 'blue'}-50 text-${isService ? 'emerald' : 'blue'}-500 rounded-full flex items-center justify-center mx-auto mb-6 text-2xl border border-${isService ? 'emerald' : 'blue'}-100`}>
+                      <i className="fas fa-exchange-alt"></i>
+                   </div>
+                   <h3 className={`font-black text-lg uppercase tracking-tight text-slate-800`}>Item encontrado na outra aba!</h3>
+                   <p className="text-sm font-medium mt-2 text-slate-500 max-w-sm mx-auto">
+                     Você está na aba de <b>{isService ? 'SERVIÇOS' : 'MATERIAIS'}</b>, mas encontramos resultados para sua busca em <b>{isService ? 'MATERIAIS' : 'SERVIÇOS'}</b>.
+                   </p>
+                   <button 
+                     onClick={() => {setView(isService ? 'catmat' : 'catser'); setCurrentPage(1)}}
+                     className={`mt-8 px-8 py-4 bg-slate-900 text-white rounded-2xl text-[10px] font-black uppercase tracking-[0.2em] hover:scale-105 transition-transform shadow-xl`}
+                   >
+                     Alternar para {isService ? 'Materiais' : 'Serviços'}
+                   </button>
+                </div>
+              ) : (
+                <>
+                  <i className="fas fa-search-minus text-6xl mb-6"></i>
+                  <h3 className="font-black text-sm uppercase tracking-[0.3em]">Nada foi encontrado</h3>
+                  <p className="text-xs font-medium mt-2">Tente ativar outras tags de sugestão da IA.</p>
+                </>
+              )}
             </div>
           ) : (
             paginatedData.map((item: any, idx) => {
               const code = item.codigoMaterial || item.codigoServico;
               const desc = item.descricaoMaterial || item.descricaoServico;
               return (
-                <div key={`${idx}-${code}`} className="bg-white p-7 rounded-[1.5rem] border border-slate-100 shadow-sm flex items-center justify-between group hover:border-blue-500 transition-all hover:shadow-xl hover:-translate-y-1">
-                  <div className="flex-1 pr-10">
-                    <div className="flex flex-wrap items-center gap-2 mb-3">
-                      <span className="text-[10px] font-black text-white bg-slate-900 px-2.5 py-1 rounded-lg uppercase tracking-widest">
+                <div key={`${idx}-${code}`} className={`bg-white p-4 rounded-xl border border-slate-100 shadow-sm flex items-center justify-between group hover:border-${themeColor}-200 transition-all hover:shadow-md`}>
+                  <div className="flex-1 pr-6">
+                    <div className="flex flex-wrap items-center gap-2 mb-2">
+                      <span className={`text-xs font-bold text-white ${isService ? 'bg-blue-600' : 'bg-emerald-600'} px-2 py-1 rounded-md`}>
                         CÓD {code}
                       </span>
-                      <span className={`text-[10px] font-black px-2.5 py-1 rounded-lg uppercase tracking-widest ${view === 'catser' ? 'text-blue-600 bg-blue-50' : 'text-emerald-600 bg-emerald-50'}`}>
-                        {item.classeDescricao}
+                      <span className={`text-xs font-semibold px-2.5 py-1 rounded-md text-${themeColor}-700 bg-${themeColor}-50`}>
+                        {toSentenceCase(item.classeDescricao)}
                       </span>
                     </div>
-                    <h4 className="text-lg font-bold text-slate-800 group-hover:text-blue-600 leading-snug transition-colors">
-                      {desc}
+                    <h4 className={`text-lg font-medium text-slate-900 group-hover:text-${themeColor}-600 leading-snug transition-colors`}>
+                      {toSentenceCase(desc)}
                     </h4>
-                    <div className="flex items-center gap-2 mt-4">
-                      <div className="w-1.5 h-1.5 bg-slate-200 rounded-full"></div>
-                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
-                        {item.grupoDescricao}
+                    <div className="flex items-center gap-2 mt-2">
+                      <div className="w-1.5 h-1.5 bg-slate-300 rounded-full"></div>
+                      <p className="text-xs font-medium text-slate-500">
+                        {toSentenceCase(item.grupoDescricao)}
                       </p>
                     </div>
                   </div>
-                  <div className="flex flex-col items-center">
+                  <div className="flex items-center">
                      <button 
                        onClick={() => {
-                          navigator.clipboard.writeText(code);
+                          navigator.clipboard.writeText(String(code));
                           const btn = document.getElementById(`btn-copy-${code}`);
                           if (btn) {
-                            const original = btn.innerHTML;
-                            btn.innerHTML = '<i class="fas fa-check text-white"></i>';
-                            btn.classList.add('bg-emerald-500');
-                            setTimeout(() => {
-                              btn.innerHTML = original;
-                              btn.classList.remove('bg-emerald-500');
-                            }, 2000);
+                            const icon = btn.querySelector('i');
+                            if (icon) {
+                              icon.className = 'fas fa-check text-emerald-500 text-base scale-110 transition-transform';
+                              setTimeout(() => {
+                                icon.className = 'fas fa-copy text-base scale-100 transition-transform';
+                              }, 2000);
+                            }
                           }
                        }}
                        id={`btn-copy-${code}`}
-                       className="w-14 h-14 rounded-2xl bg-slate-50 text-slate-400 flex items-center justify-center hover:bg-blue-600 hover:text-white transition-all active:scale-90 shadow-sm group-hover:shadow-lg"
+                       className="w-10 h-10 rounded-lg bg-transparent text-slate-400 flex items-center justify-center hover:bg-slate-100 hover:text-blue-600 transition-all active:scale-95"
                        title="Copiar Código"
                      >
-                       <i className="fas fa-copy text-lg"></i>
+                       <i className="fas fa-copy text-base"></i>
                      </button>
-                     <span className="text-[8px] font-black text-slate-300 uppercase mt-2 group-hover:text-blue-400">Copiar</span>
                   </div>
                 </div>
               );

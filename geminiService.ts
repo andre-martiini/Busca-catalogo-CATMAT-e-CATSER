@@ -7,8 +7,15 @@ export interface SearchExpansion {
   explanation: string;
 }
 
+const aiCache = new Map<string, SearchExpansion>();
+
 export const getSmartExpansion = async (query: string): Promise<SearchExpansion | null> => {
   if (!query || query.length < 3) return null;
+  
+  const normalizedQuery = query.trim().toLowerCase();
+  if (aiCache.has(normalizedQuery)) {
+    return aiCache.get(normalizedQuery)!;
+  }
 
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -46,7 +53,9 @@ export const getSmartExpansion = async (query: string): Promise<SearchExpansion 
 
     const text = response.text;
     if (!text) return null;
-    return JSON.parse(text) as SearchExpansion;
+    const result = JSON.parse(text) as SearchExpansion;
+    aiCache.set(normalizedQuery, result);
+    return result;
   } catch (error) {
     console.error("Erro na expansão semântica:", error);
     return null;
