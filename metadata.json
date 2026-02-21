@@ -1,0 +1,5 @@
+{
+  "name": "Busca Catálogo de Serviços - Compras Públicas",
+  "description": "Um sistema inteligente para busca e classificação de itens de serviços públicos, utilizando IA para auxiliar na identificação de códigos e categorias corretas do catálogo.",
+  "requestFramePermissions": []
+}
